@@ -1,0 +1,85 @@
+# ==================== CONFIG ====================
+$WorkspaceName = 'xxxxxx'      # Log Analytics workspace (exact name)
+$SettingSuffix = '-Logs'
+
+# Paste one full Resource ID per line.
+$ResourceIds = @(
+    '/subscriptions/xxxxxx/resourceGroups/xxxxxx/providers/Microsoft.Sql/servers/xxxxx/databases/master'
+)
+# ================================================
+
+
+# you need the path of the DB Master for the resouse info 
+#https://portal.azure.com/#@xxxx.cc/resource/subscriptions/xxxx/resourceGroups/xxxx/providers/Microsoft.Sql/servers/xxxxx/databases/master/overview
+
+
+
+# Resolve the workspace once
+$Law = @(Get-AzOperationalInsightsWorkspace | Where-Object Name -eq $WorkspaceName)
+if ($Law.Count -ne 1) {
+    throw "Expected exactly one workspace named '$WorkspaceName', found $($Law.Count)."
+}
+$Law = $Law[0]
+Write-Host "Workspace: $($Law.Name)`n" -ForegroundColor Cyan
+
+
+foreach ($id in $ResourceIds) {
+    $id = $id.Trim(); if (-not $id) { continue }
+
+    # Readable name from the ID. For a DB (.../servers/<srv>/databases/<db>)
+    # use "<srv>-<db>" so the setting name is descriptive and unique.
+    $seg  = $id.TrimEnd('/').Split('/')
+    $leaf = $seg[-1]
+    if ($seg.Length -ge 4 -and $seg[-2] -eq 'databases' -and $seg[-4] -eq 'servers') {
+        $display     = "$($seg[-3])/$leaf"
+        $settingName = "$($seg[-3])-$leaf$SettingSuffix"
+    } else {
+        $display     = $leaf
+        $settingName = "$leaf$SettingSuffix"
+    }
+
+    # Already enabled?
+    if (Get-AzDiagnosticSetting -ResourceId $id -ErrorAction SilentlyContinue |
+        Where-Object Name -eq $settingName) {
+        Write-Host "[$display] SKIP - '$settingName' already exists." -ForegroundColor Yellow
+        continue
+    }
+
+    # Discover categories, enable all of them
+    $cats    = Get-AzDiagnosticSettingCategory -ResourceId $id -ErrorAction SilentlyContinue
+    $logCats = @($cats | Where-Object CategoryType -eq 'Logs')
+    $metCats = @($cats | Where-Object CategoryType -eq 'Metrics')
+
+    $logObjs = @()
+    $groups  = $logCats.CategoryGroup | Where-Object { $_ } | Select-Object -Unique
+    if ($groups) {
+        foreach ($g in $groups) {
+            $logObjs += New-AzDiagnosticSettingLogSettingsObject -Enabled $true -CategoryGroup $g
+        }
+    } else {
+        foreach ($c in $logCats) {
+            $logObjs += New-AzDiagnosticSettingLogSettingsObject -Enabled $true -Category $c.Name
+        }
+    }
+
+    $metObjs = @()
+    foreach ($m in $metCats) {
+        $metObjs += New-AzDiagnosticSettingMetricSettingsObject -Enabled $true -Category $m.Name
+    }
+
+    if (-not $logObjs -and -not $metObjs) {
+        Write-Host "[$display] SKIP - resource exposes no log or metric categories." -ForegroundColor Yellow
+        continue
+    }
+
+    $params = @{ Name = $settingName; ResourceId = $id; WorkspaceId = $Law.ResourceId }
+    if ($logObjs) { $params.Log    = $logObjs }
+    if ($metObjs) { $params.Metric = $metObjs }
+
+    try {
+        New-AzDiagnosticSetting @params -ErrorAction Stop | Out-Null
+        Write-Host "[$display] CREATED '$settingName'  (logs: $($logObjs.Count), metrics: $($metObjs.Count))" -ForegroundColor Green
+    } catch {
+        Write-Host "[$display] ERROR - $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
